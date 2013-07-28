@@ -1,0 +1,16 @@
+Brainfuck interpreter package
+
+It does naive program execution, with a two optimizations:
+
+First is that jump/loop braces are found and memoized to prevent
+scans in the jump-forward or loop-back cases.
+
+Second is that large sequential blocks of the same instruction (e.g.
++++++ or >>>>>) are smashed into a single instruction that adds the
+total amount once then jumps forward past the whole thing.
+
+TODO:
+
+Put the compressed adds/moves in the instruction stream (following byte is number to increment)
+
+Re-compress instruction stream (after instruction compression; remove nops)
