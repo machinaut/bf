@@ -8,18 +8,19 @@ import (
 )
 
 const (
-	NEXT = byte('>')
-	PREV = byte('<')
-	INC  = byte('+')
-	DEC  = byte('-')
-	PUT  = byte('.')
-	GET  = byte(',')
-	JUMP = byte('[')
-	LOOP = byte(']')
-	MOVE = byte('{') // compiled NEXT
-	NOVE = byte('}') // compiled PREV (a "negative" move)
-	MATH = byte('&') // compile INC
-	NATH = byte('|') // compile DEC (a "negative" math)
+	NEXT  = byte('>')
+	PREV  = byte('<')
+	INC   = byte('+')
+	DEC   = byte('-')
+	PUT   = byte('.')
+	GET   = byte(',')
+	JUMP  = byte('[')
+	LOOP  = byte(']')
+	CNEXT = byte('{')
+	CPREV = byte('}')
+	CINC  = byte('&')
+	CDEC  = byte('|')
+	NOP   = byte(0)
 )
 
 // brainfuck interpreter
@@ -32,10 +33,6 @@ type BFInterp struct {
 	out   *bufio.Writer // output sink
 	jumps map[int]int   // jump map (left braces '[')
 	loops map[int]int   // loop map (inverse of jump map; right braces ']')
-	moves map[int]int   // map compressed moves
-	noves map[int]int   // map compressed noves
-	maths map[int]int   // map compressed maths
-	naths map[int]int   // map compressed naths
 }
 
 func NewBFInterp(prog io.Reader, in io.Reader, out io.Writer) *BFInterp {
@@ -45,20 +42,18 @@ func NewBFInterp(prog io.Reader, in io.Reader, out io.Writer) *BFInterp {
 	bfi.out = bufio.NewWriter(out)
 	bfi.jumps = make(map[int]int)
 	bfi.loops = make(map[int]int)
-	bfi.moves = make(map[int]int)
-	bfi.noves = make(map[int]int)
-	bfi.maths = make(map[int]int)
-	bfi.naths = make(map[int]int)
 
 	return bfi
 }
 
 // Run the program
 func (bfi *BFInterp) Run() {
-	// preprocess the program
+	// preprocess the program to compress instructions
+	bfi.comp()
+	// re-pack the program (remove NOPs)
+	bfi.pack()
+	// scan the program for jumps/loops
 	bfi.scan()
-
-	//bfi.Dump()
 
 	fmt.Println("Program length", len(bfi.prog))
 
@@ -90,24 +85,23 @@ func (bfi *BFInterp) Step() {
 		bfi.Jump()
 	case LOOP:
 		bfi.Loop()
-	case MOVE:
-		bfi.Move()
-	case NOVE:
-		bfi.Nove()
-	case MATH:
-		bfi.Math()
-	case NATH:
-		bfi.Nath()
+	case CNEXT:
+		bfi.CNext()
+	case CPREV:
+		bfi.CPrev()
+	case CINC:
+		bfi.CInc()
+	case CDEC:
+		bfi.CDec()
 	default:
+		//fmt.Println("ERROR: Bad Instruction: PC %d Op %d", bfi.pc, cmd)
+		// continue anyways, ignore error
 		bfi.pc += 1
 	}
 }
 
-// Scan and find matching brace sets
-func (bfi *BFInterp) scan() {
-	// quick-n-dirty stack made out of a slice
-	var stack []int
-
+// Compress repeated instructions
+func (bfi *BFInterp) comp() {
 	for idx, cmd := range bfi.prog {
 		// TODO: clean this up.  This shit is nasty.
 		if cmd == INC || cmd == DEC || cmd == NEXT || cmd == NEXT {
@@ -116,24 +110,63 @@ func (bfi *BFInterp) scan() {
 			for i = 0; i+idx < len(bfi.prog) && bfi.prog[i+idx] == cmd; i++ {
 				// TODO: theres probably a better way to do this :P
 			}
-			if i > 3 { // MAGIC NUMBER for optimizing
+			// TODO: handle the overflow case
+			if (cmd == NEXT || cmd == PREV) && i > 255 {
+				fmt.Println("ERROR: run of CMD: %c too long to compress: %d", cmd, i)
+				// continue anyways
+			}
+			// Compress if we find a run of many
+			if i > 1 {
 				// Overwrite command
 				switch cmd {
 				case NEXT:
-					bfi.prog[idx] = MOVE
-					bfi.moves[idx] = i
+					bfi.prog[idx] = CNEXT
 				case PREV:
-					bfi.prog[idx] = NOVE
-					bfi.noves[idx] = i
+					bfi.prog[idx] = CPREV
 				case INC:
-					bfi.prog[idx] = MATH
-					bfi.maths[idx] = i
+					bfi.prog[idx] = CINC
 				case DEC:
-					bfi.prog[idx] = NATH
-					bfi.naths[idx] = i
+					bfi.prog[idx] = CDEC
+				}
+				// Byte following compressed command is number to apply
+				bfi.prog[idx+1] = byte(i % 256)
+				// Overwrite rest of the commands with no-ops
+				for j := 2; j < i; j++ {
+					bfi.prog[idx+j] = NOP
 				}
 			}
 		}
+	}
+}
+
+// Re-pack instruction stream to ignore nops
+func (bfi *BFInterp) pack() {
+	p := make([]byte, len(bfi.prog))
+	j := 0 // index into p
+	for i := 0; i < len(bfi.prog); i++ {
+		cmd := bfi.prog[i]
+		switch cmd {
+		case NEXT, PREV, INC, DEC, PUT, GET, JUMP, LOOP:
+			p[j] = cmd
+			j++
+		case CNEXT, CPREV, CINC, CDEC:
+			p[j] = cmd
+			p[j+1] = bfi.prog[i+1]
+			j += 2
+			i++ // skip next byte
+		}
+	}
+	// Replace old program with new
+	bfi.prog = p[0:j]
+}
+
+// Scan and find matching brace sets
+func (bfi *BFInterp) scan() {
+	// quick-n-dirty stack made out of a slice
+	var stack []int
+
+	for idx, cmd := range bfi.prog {
+		// Memoize jumps
 		if cmd == JUMP {
 			stack = append(stack, idx) // push
 		} else if cmd == LOOP {
@@ -147,18 +180,8 @@ func (bfi *BFInterp) scan() {
 
 // Dump table info to stdout for debugging
 func (bfi *BFInterp) Dump() {
-	fmt.Println("Jumps:")
-	fmt.Println(bfi.jumps)
-	fmt.Println("Loops:")
-	fmt.Println(bfi.loops)
-	fmt.Println("Moves:")
-	fmt.Println(bfi.moves)
-	fmt.Println("Noves:")
-	fmt.Println(bfi.noves)
-	fmt.Println("Maths:")
-	fmt.Println(bfi.maths)
-	fmt.Println("Naths:")
-	fmt.Println(bfi.naths)
+	fmt.Println("Jumps:", bfi.jumps)
+	fmt.Println("Loops:", bfi.loops)
 }
 
 // >
@@ -213,25 +236,32 @@ func (bfi *BFInterp) Loop() {
 }
 
 // > compressed
-func (bfi *BFInterp) Move() {
-	bfi.ptr += bfi.moves[bfi.pc]
-	bfi.pc += bfi.moves[bfi.pc]
+func (bfi *BFInterp) CNext() {
+	bfi.ptr += int(bfi.prog[bfi.pc+1])
+	bfi.pc += 2
 }
 
 // < compressed
-func (bfi *BFInterp) Nove() {
-	bfi.ptr -= bfi.noves[bfi.pc]
-	bfi.pc += bfi.noves[bfi.pc]
+func (bfi *BFInterp) CPrev() {
+	bfi.ptr -= int(bfi.prog[bfi.pc+1])
+	bfi.pc += 2
 }
 
 // + compressed
-func (bfi *BFInterp) Math() {
-	bfi.mem[bfi.ptr] = byte(int(bfi.mem[bfi.ptr]) + bfi.maths[bfi.pc])
-	bfi.pc += bfi.maths[bfi.pc]
+func (bfi *BFInterp) CInc() {
+	//fmt.Printf("CInc ")
+	//fmt.Printf("pc:%d ", bfi.pc)
+	//fmt.Printf("cmd:%d ", bfi.prog[bfi.pc])
+	//fmt.Printf("val:%d ", bfi.prog[bfi.pc+1])
+	//fmt.Printf("ptr:%d ", bfi.ptr)
+	//fmt.Printf("mem:%d", bfi.mem[bfi.ptr])
+	//fmt.Printf("\n")
+	bfi.mem[bfi.ptr] += bfi.prog[bfi.pc+1]
+	bfi.pc += 2
 }
 
 // - compressed
-func (bfi *BFInterp) Nath() {
-	bfi.mem[bfi.ptr] = byte(int(bfi.mem[bfi.ptr]) - bfi.naths[bfi.pc])
-	bfi.pc += bfi.naths[bfi.pc]
+func (bfi *BFInterp) CDec() {
+	bfi.mem[bfi.ptr] -= bfi.prog[bfi.pc+1]
+	bfi.pc += 2
 }
